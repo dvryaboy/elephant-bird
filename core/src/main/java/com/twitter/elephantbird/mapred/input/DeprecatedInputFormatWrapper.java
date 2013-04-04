@@ -1,5 +1,7 @@
 package com.twitter.elephantbird.mapred.input;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
@@ -7,6 +9,9 @@ import java.util.List;
 
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.io.WritableUtils;
+import org.apache.hadoop.io.serializer.Deserializer;
+import org.apache.hadoop.io.serializer.SerializationFactory;
+import org.apache.hadoop.io.serializer.Serializer;
 import org.apache.hadoop.mapred.Counters;
 import org.apache.hadoop.mapred.FileSplit;
 import org.apache.hadoop.mapred.InputSplit;
@@ -186,6 +191,18 @@ public class DeprecatedInputFormatWrapper<K, V> implements org.apache.hadoop.map
     private boolean firstRecord = false;
     private boolean eof = false;
 
+    private final Serializer<K> keySerializer;
+    private final Serializer<V> valueSerializer;
+
+    private final Deserializer<K> keyDeserializer;
+    private final Deserializer<V> valueDeserializer;
+    private final ByteArrayOutputStream keyDaos;
+    private final ByteArrayOutputStream valueDaos;
+    private final UnsafeByteArrayInputStream keyDais;
+    private final UnsafeByteArrayInputStream valueDais;
+
+
+
     public RecordReaderWrapper(InputFormat<K, V> newInputFormat,
                                InputSplit oldSplit,
                                JobConf oldJobConf,
@@ -215,12 +232,15 @@ public class DeprecatedInputFormatWrapper<K, V> implements org.apache.hadoop.map
         new TaskInputOutputContext(oldJobConf, taskAttemptID,
             null, null, new ReporterWrapper(reporter)) {
 
+              @Override
               public Object getCurrentKey() throws IOException, InterruptedException {
                 throw new RuntimeException("not implemented");
               }
+              @Override
               public Object getCurrentValue() throws IOException, InterruptedException {
                 throw new RuntimeException("not implemented");
               }
+              @Override
               public boolean nextKeyValue() throws IOException, InterruptedException {
                 throw new RuntimeException("not implemented");
               }
@@ -235,16 +255,71 @@ public class DeprecatedInputFormatWrapper<K, V> implements org.apache.hadoop.map
           firstRecord = true;
           keyObj = realReader.getCurrentKey();
           valueObj = realReader.getCurrentValue();
+          SerializationFactory fact = new SerializationFactory(oldJobConf);
+          if (keyObj != null) {
+            keySerializer = fact.getSerializer((Class<K>) keyObj.getClass());
+            keyDeserializer = fact.getDeserializer((Class<K>) keyObj.getClass());
+            keyDaos = new ByteArrayOutputStream(1048576); // 1 MB
+            keySerializer.open(keyDaos);
+            keyDais = new UnsafeByteArrayInputStream(keyDaos.toByteArray());
+            keyDeserializer.open(keyDais);
+          } else {
+            keySerializer = null;
+            keyDeserializer = null;
+            keyDais = null;
+            keyDaos = null;
+          }
+
+          if (valueObj != null) {
+            valueSerializer = fact.getSerializer((Class<V>) valueObj.getClass());
+            valueDeserializer = fact.getDeserializer((Class<V>) valueObj.getClass());
+            valueDaos = new ByteArrayOutputStream(1048576); // 1 MB
+            valueSerializer.open(valueDaos);
+            valueDais = new UnsafeByteArrayInputStream(valueDaos.toByteArray());
+            valueDeserializer.open(valueDais);
+          } else {
+            valueSerializer = null;
+            valueDeserializer = null;
+            valueDais = null;
+            valueDaos = null;
+          }
         } else {
           eof = true;
+          keyDeserializer = null;
+          keySerializer = null;
+          valueDeserializer = null;
+          valueSerializer = null;
+          valueDais = null;
+          valueDaos = null;
+          keyDais = null;
+          keyDaos = null;
         }
       } catch (InterruptedException e) {
         throw new IOException(e);
       }
     }
 
+    private static class UnsafeByteArrayInputStream extends ByteArrayInputStream {
+
+      public UnsafeByteArrayInputStream(byte[] buf) {
+        super(buf);
+      }
+
+      public void reset(byte[] buf) {
+        reset();
+        this.buf = buf;
+        this.pos = 0;
+        this.count = buf.length;
+      }
+
+    }
+
     @Override
     public void close() throws IOException {
+      if (keySerializer != null) keySerializer.close();
+      if (keyDeserializer != null) keyDeserializer.close();
+      if (valueSerializer != null) valueSerializer.close();
+      if (valueDeserializer != null) valueDeserializer.close();
       realReader.close();
     }
 
@@ -288,17 +363,9 @@ public class DeprecatedInputFormatWrapper<K, V> implements org.apache.hadoop.map
 
           if (key != realReader.getCurrentKey() ||
               value != realReader.getCurrentValue()) {
-
-            throw new IOException("DeprecatedInputFormatWrapper can not "
-                + "support RecordReaders that don't return same key & value "
-                + "objects. current reader class : " + realReader.getClass());
-
-            // other alternative is to copy key and value objects, unfortunately
-            // we need to pay that cost even for reader that reuse the object.
-            // good compromise is to let this be set by config. we can add that
-            // when required.
+              copyKey(realReader.getCurrentKey(), key);
+              copyValue(realReader.getCurrentValue(), value);
           }
-
           return true;
         }
       } catch (InterruptedException e) {
@@ -308,7 +375,24 @@ public class DeprecatedInputFormatWrapper<K, V> implements org.apache.hadoop.map
       eof = true; // strictly not required, just for consistency
       return false;
     }
+
+    private void copyKey(K from, K to) throws IOException {
+      if (from == to) return;
+      keySerializer.serialize(from);
+      keyDais.reset(keyDaos.toByteArray());
+      keyDeserializer.deserialize(to);
+    }
+
+    private void copyValue(V from, V to) throws IOException {
+      if (from == to) return;
+      valueSerializer.serialize(from);
+      valueDais.reset(valueDaos.toByteArray());
+      valueDeserializer.deserialize(to);
+    }
+
   }
+
+
 
   private static class InputSplitWrapper implements InputSplit {
 
